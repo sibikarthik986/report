@@ -1,0 +1,535 @@
+db_utils.py from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from .models import AccessLog, AnomalyLog
+
+DATABASE_URL = "sqlite:///logs/waf_logs.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def insert_access_log(ip, username, path, status, user_agent):
+    session = SessionLocal()
+    try:
+        log = AccessLog(ip=ip, username=username, path=path, status=status, user_agent=user_agent)
+        session.add(log)
+        session.commit()
+    finally:
+        session.close()
+
+def insert_anomaly_log(ip, username, path, type, payload):
+    session = SessionLocal()
+    try:
+        log = AnomalyLog(ip=ip, username=username, path=path, type=type, payload=payload)
+        session.add(log)
+        session.commit()
+    finally:
+        session.close()
+models.py
+# app/db/models.py
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Column, Integer, String, DateTime
+
+Base = declarative_base()
+
+class AccessLog(Base):
+    __tablename__ = 'access_logs'
+    id = Column(Integer, primary_key=True)
+    ip = Column(String)
+    username = Column(String)
+    path = Column(String)
+    status = Column(String)
+    user_agent = Column(String)
+    timestamp = Column(DateTime)
+
+class AnomalyLog(Base):
+    __tablename__ = 'anomaly_logs'
+    id = Column(Integer, primary_key=True)
+    ip = Column(String)
+    username = Column(String)
+    path = Column(String)
+    anomaly_type = Column(String)
+    payload = Column(String)
+    timestamp = Column(DateTime)
+
+anomaly_detector.py
+
+import joblib
+import numpy as np
+from sklearn.ensemble import IsolationForest
+from config import MODEL_PATH
+import os
+
+class AnomalyDetector:
+    def __init__(self):
+        self.model = None
+        self.load_model()
+
+    def load_model(self):
+        if os.path.exists(MODEL_PATH):
+            self.model = joblib.load(MODEL_PATH)
+        else:
+            self.model = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
+            # In a real application, you would train the model here with your dataset
+            # For now we'll just save the untrained model
+            self.save_model()
+
+    def save_model(self):
+        joblib.dump(self.model, MODEL_PATH)
+
+    def extract_features(self, request_data):
+        # Extract features from request data for the ML model
+        # This is a simplified example - in a real app you'd extract more meaningful features
+        features = [
+            len(str(request_data.get('username', ''))),
+            len(str(request_data.get('password', ''))),
+            len(str(request_data)),
+            int(any(char in str(request_data) for char in ['<', '>', "'", '"', '='])),
+            int('script' in str(request_data).lower()),
+            int('select' in str(request_data).lower() and 'from' in str(request_data).lower()),
+        ]
+        return np.array(features).reshape(1, -1)
+
+    def detect(self, request_data):
+        features = self.extract_features(request_data)
+        prediction = self.model.predict(features)
+        return prediction[0] == -1  # -1 means anomaly in IsolationForest
+
+detector.py 
+import re
+from datetime import datetime, timedelta
+from config import BRUTE_FORCE_ATTEMPTS, BRUTE_FORCE_WINDOW
+from .logger import log_anomaly
+
+class AttackDetector:
+    def __init__(self):
+        self.login_attempts = {}
+        self.xss_patterns = [
+            r'<script.*?>.*?</script>',
+            r'onerror\s*=\s*".*?"',
+            r'onload\s*=\s*".*?"',
+            r'javascript:'
+        ]
+        self.sql_injection_patterns = [
+            r'(\'|"|`).*?(\bOR\b|\bAND\b).*?=.*?\1',
+            r'(\'|"|`).*?\bUNION\b.*?\bSELECT\b.*?\1',
+            r'\bDROP\b.*?\bTABLE\b',
+            r'\bINSERT\b.*?\bINTO\b',
+            r'\bDELETE\b.*?\bFROM\b',
+            r'\bEXEC\b.*?\('
+        ]
+
+    def detect_brute_force(self, ip, username):
+        now = datetime.now()
+        key = f"{ip}-{username}"
+        
+        if key not in self.login_attempts:
+            self.login_attempts[key] = []
+        
+        # Remove attempts older than our window
+        self.login_attempts[key] = [
+            attempt for attempt in self.login_attempts[key] 
+            if now - attempt < timedelta(seconds=BRUTE_FORCE_WINDOW)
+        ]
+        
+        self.login_attempts[key].append(now)
+        
+        if len(self.login_attempts[key]) >= BRUTE_FORCE_ATTEMPTS:
+            log_anomaly(ip, username, '/login', 'brute_force', 'Repeated login attempts')
+            return True
+        return False
+
+    def detect_xss(self, input_data):
+        if not input_data:
+            return False
+            
+        input_str = str(input_data).lower()
+        for pattern in self.xss_patterns:
+            if re.search(pattern, input_str, re.IGNORECASE):
+                return True
+        return False
+
+    def detect_sql_injection(self, input_data):
+        if not input_data:
+            return False
+            
+        input_str = str(input_data).lower()
+        for pattern in self.sql_injection_patterns:
+            if re.search(pattern, input_str, re.IGNORECASE):
+                return True
+        return False
+
+    def detect_anomaly(self, ip, username, path, input_data):
+        if self.detect_brute_force(ip, username):
+            return 'brute_force'
+        if self.detect_xss(input_data):
+            log_anomaly(ip, username, path, 'xss', input_data)
+            return 'xss'
+        if self.detect_sql_injection(input_data):
+            log_anomaly(ip, username, path, 'sql_injection', input_data)
+            return 'sql_injection'
+        return None
+hashing.py
+import bcrypt
+
+def hash_password(password: str) -> str:
+    """Hash a password for storing."""
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed.decode('utf-8')
+
+def verify_password(stored_hash: str, provided_password: str) -> bool:
+    """Verify a stored password against one provided by user"""
+    return bcrypt.checkpw(
+        provided_password.encode('utf-8'),
+        stored_hash.encode('utf-8')
+    )
+logger.py
+
+# app/security/logger.py
+
+import os
+from datetime import datetime
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from config import ACCESS_LOG, ANOMALY_LOG
+
+from app.db.models import AccessLog, AnomalyLog
+
+# Ensure logs directory exists
+def ensure_log_directory():
+    os.makedirs(os.path.dirname(ACCESS_LOG), exist_ok=True)
+    os.makedirs(os.path.dirname(ANOMALY_LOG), exist_ok=True)
+
+# SQLite database
+DATABASE_URL = "sqlite:///logs/waf_logs.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+
+def log_access(ip, username, path, status, user_agent):
+    ensure_log_directory()
+    timestamp = datetime.now()
+
+    # Write to file
+    log_entry = f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')} - IP: {ip} - User: {username} - Path: {path} - Status: {status} - Agent: {user_agent}\n"
+    with open(ACCESS_LOG, 'a') as f:
+        f.write(log_entry)
+
+    # Save to DB
+    db = SessionLocal()
+    db_log = AccessLog(
+        ip=ip,
+        username=username,
+        path=path,
+        status=status,
+        user_agent=user_agent,
+        timestamp=timestamp
+    )
+    db.add(db_log)
+    db.commit()
+    db.close()
+
+def log_anomaly(ip, username, path, anomaly_type, payload):
+    ensure_log_directory()
+    timestamp = datetime.now()
+
+    # Write to file
+    log_entry = f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')} - IP: {ip} - User: {username} - Path: {path} - Type: {anomaly_type} - Payload: {payload}\n"
+    with open(ANOMALY_LOG, 'a') as f:
+        f.write(log_entry)
+
+    # Save to DB
+    db = SessionLocal()
+    db_log = AnomalyLog(
+        ip=ip,
+        username=username,
+        path=path,
+        anomaly_type=anomaly_type,
+        payload=str(payload),
+        timestamp=timestamp
+    )
+    db.add(db_log)
+    db.commit()
+    db.close()
+index.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Home</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="#">ML-Enhanced WAF</a>
+            <div class="navbar-nav ms-auto">
+                <span class="navbar-text me-3">Welcome, {{ username }}</span>
+                <a class="btn btn-outline-light" href="{{ url_for('logout') }}">Logout</a>
+            </div>
+        </div>
+    </nav>
+    <div class="container mt-5">
+        <div class="row">
+            <div class="col-md-8 mx-auto">
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="text-center">Welcome to the Secure Application</h3>
+                    </div>
+                    <div class="card-body">
+                        <p>This application is protected by a machine learning-enhanced web application firewall that detects and blocks suspicious activity.</p>
+                        <p>Try entering malicious inputs in the login or registration forms to see the WAF in action.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+LOGIN.HTML <!DOCTYPE html>
+<html>
+<head>
+    <title>Login</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="row justify-content-center">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="text-center">Login</h3>
+                    </div>
+                    <div class="card-body">
+                        {% with messages = get_flashed_messages(with_categories=true) %}
+                            {% if messages %}
+                                {% for category, message in messages %}
+                                    <div class="alert alert-{{ category }}">{{ message }}</div>
+                                {% endfor %}
+                            {% endif %}
+                        {% endwith %}
+                        <form method="POST" action="{{ url_for('login') }}">
+                            <div class="mb-3">
+                                <label for="username" class="form-label">Username</label>
+                                <input type="text" class="form-control" id="username" name="username" required>
+                            </div>
+                            <div class="mb-3">
+                                <label for="password" class="form-label">Password</label>
+                                <input type="password" class="form-control" id="password" name="password" required>
+                            </div>
+                            <button type="submit" class="btn btn-primary w-100">Login</button>
+                        </form>
+                        <div class="mt-3 text-center">
+                            <a href="{{ url_for('register') }}">Don't have an account? Register</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+register.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Register</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="row justify-content-center">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="text-center">Register</h3>
+                    </div>
+                    <div class="card-body">
+                        {% with messages = get_flashed_messages(with_categories=true) %}
+                            {% if messages %}
+                                {% for category, message in messages %}
+                                    <div class="alert alert-{{ category }}">{{ message }}</div>
+                                {% endfor %}
+                            {% endif %}
+                        {% endwith %}
+                        <form method="POST" action="{{ url_for('register') }}">
+                            <div class="mb-3">
+                                <label for="username" class="form-label">Username</label>
+                                <input type="text" class="form-control" id="username" name="username" required>
+                            </div>
+                            <div class="mb-3">
+                                <label for="password" class="form-label">Password (min 8 characters)</label>
+                                <input type="password" class="form-control" id="password" name="password" required>
+                                <div class="form-text">Password must be at least 8 characters long</div>
+                            </div>
+                            <button type="submit" class="btn btn-primary w-100">Register</button>
+                        </form>
+                        <div class="mt-3 text-center">
+                            <a href="{{ url_for('login') }}">Already have an account? Login</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+main.p from flask import Flask, request
+from .security.detector import AttackDetector
+from .security.logger import log_access
+
+app = Flask(__name__)
+detector = AttackDetector()
+
+@app.route('/login', methods=['POST'])
+def login():
+    ip = request.remote_addr
+    username = request.form.get('username')
+    password = request.form.get('password')
+    user_agent = request.headers.get('User-Agent')
+
+    log_access(ip, username, '/login', 'attempt', user_agent)
+
+    if detector.detect_brute_force(ip, username):
+        return "Too many login attempts", 429
+
+    # Add your authentication logic here
+    return "Login processed"
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+config.py
+
+import os
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Security settings
+ALLOWED_HOSTS = ['*']
+
+# Logging paths
+LOG_DIR = os.path.join(BASE_DIR, 'logs')
+ACCESS_LOG = os.path.join(LOG_DIR, 'access.log')
+ANOMALY_LOG = os.path.join(LOG_DIR, 'anomalies.log')
+
+# Model paths
+MODEL_PATH = os.path.join(BASE_DIR, 'app', 'models', 'model.pkl')
+
+# Security thresholds
+ANOMALY_THRESHOLD = 0.8
+BRUTE_FORCE_ATTEMPTS = 5
+BRUTE_FORCE_WINDOW = 300  # 5 minutes in seconds
+MIN_PASSWORD_LENGTH = 8
+
+
+create_db.py
+# create_db.py
+import os
+import sys
+
+# Ensure this directory is in sys.path
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+
+from app.db.models import Base
+from sqlalchemy import create_engine
+
+# Use SQLite file inside logs directory
+DATABASE_URL = "sqlite:///logs/waf_logs.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+
+def create_database():
+    Base.metadata.create_all(bind=engine)
+    print("✅ Database tables created.")
+
+if __name__ == "__main__":
+    create_database()
+
+requirement.txt 
+flask==2.3.2
+scikit-learn==1.6.1
+pandas==2.2.3
+numpy==2.2.5
+python-dotenv==1.0.0
+werkzeug==3.1.3
+joblib==1.5.0
+bcrypt==4.0.1
+sqlalchemy==2.0.41
+
+train_model.py 
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from joblib import dump
+from config import MODEL_PATH
+import os
+
+# This is a simplified example - in a real application you would use real attack data
+def generate_training_data():
+    # Normal data
+    normal_data = {
+        'username_len': np.random.randint(5, 10, 1000),
+        'password_len': np.random.randint(8, 15, 1000),
+        'input_len': np.random.randint(20, 50, 1000),
+        'special_chars': np.random.choice([0, 1], 1000, p=[0.9, 0.1]),
+        'script_keyword': np.zeros(1000),
+        'sql_keywords': np.zeros(1000)
+    }
+    
+    # Anomalous data (attacks)
+    anomalous_data = {
+        'username_len': np.random.randint(1, 30, 200),
+        'password_len': np.random.randint(1, 30, 200),
+        'input_len': np.random.randint(50, 500, 200),
+        'special_chars': np.random.choice([0, 1], 200, p=[0.1, 0.9]),
+        'script_keyword': np.ones(200),
+        'sql_keywords': np.random.choice([0, 1], 200, p=[0.3, 0.7])
+    }
+    
+    normal_df = pd.DataFrame(normal_data)
+    anomalous_df = pd.DataFrame(anomalous_data)
+    
+    # Label data (1 for normal, -1 for anomaly)
+    normal_df['label'] = 1
+    anomalous_df['label'] = -1
+    
+    # Combine and shuffle
+    df = pd.concat([normal_df, anomalous_df]).sample(frac=1).reset_index(drop=True)
+    X = df.drop('label', axis=1).values
+    y = df['label'].values
+    
+    return X, y
+
+def train_and_save_model():
+    X, y = generate_training_data()
+    
+    # Train Isolation Forest model
+    model = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
+    model.fit(X)
+    
+    # Save the model
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    dump(model, MODEL_PATH)
+    print(f"Model trained and saved to {MODEL_PATH}")
+
+if __name__ == '__main__':
+    train_and_save_model()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
